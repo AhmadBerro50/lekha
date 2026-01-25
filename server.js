@@ -400,11 +400,21 @@ function handleMessage(ws, message) {
 
 function sendRoomList(ws) {
     const publicRooms = [];
+    console.log(`📋 Checking ${rooms.size} total rooms for listing...`);
+
     for (const room of rooms.values()) {
-        if (!room.isPrivate && !room.gameInProgress && room.players.size < 4) {
+        const isPublic = !room.isPrivate;
+        const notInProgress = !room.gameInProgress;
+        const hasSpace = room.players.size < 4;
+
+        console.log(`  Room "${room.name}": public=${isPublic}, notInProgress=${notInProgress}, hasSpace=${hasSpace} (${room.players.size}/4)`);
+
+        if (isPublic && notInProgress && hasSpace) {
             publicRooms.push(room.toJSON());
         }
     }
+
+    console.log(`📤 Sending ${publicRooms.length} rooms to client`);
 
     send(ws, {
         Type: MessageType.RoomList,
@@ -439,13 +449,17 @@ function handleCreateRoom(ws, player, data) {
         const roomData = JSON.parse(data);
         const roomId = uuidv4();
         const roomName = roomData.RoomName || `${player.name}'s Room`;
-        const isPrivate = roomData.IsPrivate || false;
+        // Explicitly check for true to avoid any falsy issues
+        const isPrivate = roomData.IsPrivate === true;
+
+        console.log(`📝 Creating room - Raw data: ${data}`);
+        console.log(`📝 Parsed: name="${roomName}", isPrivate=${isPrivate} (raw: ${roomData.IsPrivate})`);
 
         const room = new GameRoom(roomId, roomName, player.id, isPrivate);
 
         if (room.addPlayer(player)) {
             rooms.set(roomId, room);
-            console.log(`🏠 Room created: ${roomName} (${roomId}) by ${player.name}`);
+            console.log(`🏠 Room created: ${roomName} (${roomId}) by ${player.name}, private=${isPrivate}`);
 
             send(ws, {
                 Type: MessageType.RoomJoined,
