@@ -51,6 +51,8 @@ const MessageType = {
     PlayerLeft: 'PlayerLeft',
     PlayerDisconnected: 'PlayerDisconnected',
     PlayerReconnected: 'PlayerReconnected',
+    SelectPosition: 'SelectPosition',
+    PositionSelected: 'PositionSelected',
     SetReady: 'SetReady',
     StartGame: 'StartGame',
     GameStarted: 'GameStarted',
@@ -385,6 +387,9 @@ function handleMessage(ws, message) {
 
     const { Type, Data, SenderId } = message;
 
+    // Debug: log all incoming message types
+    console.log(`📩 Received message type: "${Type}" (length: ${Type?.length})`);
+
     switch (Type) {
         case MessageType.Ping:
             send(ws, { Type: MessageType.Pong, Data: Date.now().toString() });
@@ -424,6 +429,10 @@ function handleMessage(ws, message) {
 
         case MessageType.SetReady:
             handleSetReady(ws, player, Data);
+            break;
+
+        case MessageType.SelectPosition:
+            handleSelectPosition(ws, player, Data);
             break;
 
         case MessageType.StartGame:
@@ -628,6 +637,50 @@ function handleSetReady(ws, player, data) {
 
     player.isReady = data === 'true' || data === true;
     console.log(`✋ ${player.name} is ${player.isReady ? 'ready' : 'not ready'}`);
+
+    room.broadcast({
+        Type: MessageType.RoomUpdated,
+        Data: JSON.stringify(room.toJSON(true))
+    });
+}
+
+function handleSelectPosition(ws, player, data) {
+    if (!player.roomId) return;
+
+    const room = rooms.get(player.roomId);
+    if (!room) return;
+
+    // Parse the requested position (North, South, East, West)
+    const requestedPosition = data;
+    const validPositions = ['North', 'South', 'East', 'West'];
+
+    if (!validPositions.includes(requestedPosition)) {
+        sendError(ws, 'Invalid position');
+        return;
+    }
+
+    // Check if position is already taken
+    for (const p of room.players.values()) {
+        if (p.position === requestedPosition && p.id !== player.id) {
+            sendError(ws, 'Position already taken');
+            return;
+        }
+    }
+
+    // Assign the position
+    const oldPosition = player.position;
+    player.position = requestedPosition;
+    console.log(`📍 ${player.name} selected position: ${requestedPosition}${oldPosition ? ' (was ' + oldPosition + ')' : ''}`);
+
+    // Notify all players in the room
+    room.broadcast({
+        Type: MessageType.PositionSelected,
+        Data: JSON.stringify({
+            PlayerId: player.id,
+            Position: requestedPosition,
+            OldPosition: oldPosition
+        })
+    });
 
     room.broadcast({
         Type: MessageType.RoomUpdated,
