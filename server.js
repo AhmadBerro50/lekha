@@ -110,27 +110,16 @@ class Player {
 }
 
 class GameRoom {
-    constructor(id, name, hostId, isPrivate = false) {
+    constructor(id, name, hostId) {
         this.id = id;
         this.name = name;
         this.hostId = hostId;
-        this.isPrivate = isPrivate;
-        this.roomCode = this.generateRoomCode();
         this.players = new Map(); // playerId -> Player
         this.spectators = new Map(); // oddziela spectators
         this.maxPlayers = 4;
         this.gameInProgress = false;
         this.gameState = null;
         this.createdAt = Date.now();
-    }
-
-    generateRoomCode() {
-        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-        let code = '';
-        for (let i = 0; i < 6; i++) {
-            code += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
-        return code;
     }
 
     addPlayer(player) {
@@ -199,23 +188,17 @@ class GameRoom {
         return true;
     }
 
-    toJSON(includeCode = false) {
-        const data = {
+    toJSON() {
+        return {
             RoomId: this.id,
             RoomName: this.name,
             Players: Array.from(this.players.values()).map(p => p.toJSON()),
             MaxPlayers: this.maxPlayers,
-            IsPrivate: this.isPrivate,
+            IsPrivate: false, // Always public
             GameInProgress: this.gameInProgress,
             CanStart: this.canStart(),
             SpectatorCount: this.spectators.size
         };
-
-        if (includeCode || !this.isPrivate) {
-            data.RoomCode = this.roomCode;
-        }
-
-        return data;
     }
 
     // Broadcast to all players in room
@@ -348,10 +331,6 @@ function handleMessage(ws, message) {
             handleJoinRoom(ws, player, Data);
             break;
 
-        case MessageType.JoinRoomByCode:
-            handleJoinRoomByCode(ws, player, Data);
-            break;
-
         case MessageType.LeaveRoom:
             handleLeaveRoom(ws, player);
             break;
@@ -399,26 +378,25 @@ function handleMessage(ws, message) {
 }
 
 function sendRoomList(ws) {
-    const publicRooms = [];
+    const availableRooms = [];
     console.log(`📋 Checking ${rooms.size} total rooms for listing...`);
 
     for (const room of rooms.values()) {
-        const isPublic = !room.isPrivate;
         const notInProgress = !room.gameInProgress;
         const hasSpace = room.players.size < 4;
 
-        console.log(`  Room "${room.name}": public=${isPublic}, notInProgress=${notInProgress}, hasSpace=${hasSpace} (${room.players.size}/4)`);
+        console.log(`  Room "${room.name}": notInProgress=${notInProgress}, hasSpace=${hasSpace} (${room.players.size}/4)`);
 
-        if (isPublic && notInProgress && hasSpace) {
-            publicRooms.push(room.toJSON());
+        if (notInProgress && hasSpace) {
+            availableRooms.push(room.toJSON());
         }
     }
 
-    console.log(`📤 Sending ${publicRooms.length} rooms to client`);
+    console.log(`📤 Sending ${availableRooms.length} rooms to client`);
 
     send(ws, {
         Type: MessageType.RoomList,
-        Data: JSON.stringify(publicRooms)
+        Data: JSON.stringify(availableRooms)
     });
 }
 
@@ -449,21 +427,18 @@ function handleCreateRoom(ws, player, data) {
         const roomData = JSON.parse(data);
         const roomId = uuidv4();
         const roomName = roomData.RoomName || `${player.name}'s Room`;
-        // Explicitly check for true to avoid any falsy issues
-        const isPrivate = roomData.IsPrivate === true;
 
-        console.log(`📝 Creating room - Raw data: ${data}`);
-        console.log(`📝 Parsed: name="${roomName}", isPrivate=${isPrivate} (raw: ${roomData.IsPrivate})`);
+        console.log(`📝 Creating room: "${roomName}" by ${player.name}`);
 
-        const room = new GameRoom(roomId, roomName, player.id, isPrivate);
+        const room = new GameRoom(roomId, roomName, player.id);
 
         if (room.addPlayer(player)) {
             rooms.set(roomId, room);
-            console.log(`🏠 Room created: ${roomName} (${roomId}) by ${player.name}, private=${isPrivate}`);
+            console.log(`🏠 Room created: ${roomName} (${roomId}) by ${player.name}`);
 
             send(ws, {
                 Type: MessageType.RoomJoined,
-                Data: JSON.stringify(room.toJSON(true))
+                Data: JSON.stringify(room.toJSON())
             });
         } else {
             sendError(ws, 'Failed to create room');
@@ -515,30 +490,6 @@ function handleJoinRoom(ws, player, data) {
         }
     } catch (e) {
         console.error('Error joining room:', e);
-        sendError(ws, 'Failed to join room');
-    }
-}
-
-function handleJoinRoomByCode(ws, player, data) {
-    try {
-        const code = (typeof data === 'string' ? data.replace(/"/g, '') : data).toUpperCase();
-
-        let targetRoom = null;
-        for (const room of rooms.values()) {
-            if (room.roomCode === code) {
-                targetRoom = room;
-                break;
-            }
-        }
-
-        if (!targetRoom) {
-            sendError(ws, 'Invalid room code');
-            return;
-        }
-
-        handleJoinRoom(ws, player, targetRoom.id);
-    } catch (e) {
-        console.error('Error joining by code:', e);
         sendError(ws, 'Failed to join room');
     }
 }
