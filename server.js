@@ -36,6 +36,8 @@ const MessageType = {
     Connected: 'Connected',
     Disconnected: 'Disconnected',
     Error: 'Error',
+    Reconnect: 'Reconnect',
+    ReconnectSuccess: 'ReconnectSuccess',
 
     // Lobby
     CreateRoom: 'CreateRoom',
@@ -47,6 +49,8 @@ const MessageType = {
     RoomUpdated: 'RoomUpdated',
     PlayerJoined: 'PlayerJoined',
     PlayerLeft: 'PlayerLeft',
+    PlayerDisconnected: 'PlayerDisconnected',
+    PlayerReconnected: 'PlayerReconnected',
     SetReady: 'SetReady',
     StartGame: 'StartGame',
     GameStarted: 'GameStarted',
@@ -109,13 +113,17 @@ class Player {
     }
 }
 
+// Reconnection timeout in milliseconds (60 seconds)
+const RECONNECT_TIMEOUT = 60 * 1000;
+
 class GameRoom {
     constructor(id, name, hostId) {
         this.id = id;
         this.name = name;
         this.hostId = hostId;
         this.players = new Map(); // playerId -> Player
-        this.spectators = new Map(); // oddziela spectators
+        this.spectators = new Map(); // spectators
+        this.disconnectedPlayers = new Map(); // playerId -> { player, disconnectTime, timeout }
         this.maxPlayers = 4;
         this.gameInProgress = false;
         this.gameState = null;
@@ -163,6 +171,66 @@ class GameRoom {
         return player;
     }
 
+    // Mark a player as disconnected (during a game) - they can still reconnect
+    markPlayerDisconnected(playerId) {
+        const player = this.players.get(playerId);
+        if (!player) return null;
+
+        // Store disconnected player info (preserve their position, ready state etc.)
+        const disconnectInfo = {
+            playerId: player.id,
+            name: player.name,
+            avatarData: player.avatarData,
+            position: player.position,
+            isHost: player.isHost,
+            isReady: player.isReady,
+            disconnectTime: Date.now(),
+            timeout: null
+        };
+
+        this.disconnectedPlayers.set(playerId, disconnectInfo);
+        this.players.delete(playerId);
+
+        console.log(`⏳ Player ${player.name} marked as disconnected, waiting for reconnect...`);
+
+        return disconnectInfo;
+    }
+
+    // Reconnect a player
+    reconnectPlayer(ws, playerId) {
+        const disconnectInfo = this.disconnectedPlayers.get(playerId);
+        if (!disconnectInfo) return null;
+
+        // Clear the timeout
+        if (disconnectInfo.timeout) {
+            clearTimeout(disconnectInfo.timeout);
+        }
+
+        // Recreate the player with their original state
+        const player = new Player(ws, playerId, disconnectInfo.name, disconnectInfo.avatarData);
+        player.position = disconnectInfo.position;
+        player.isHost = disconnectInfo.isHost;
+        player.isReady = disconnectInfo.isReady;
+        player.roomId = this.id;
+
+        this.players.set(playerId, player);
+        this.disconnectedPlayers.delete(playerId);
+
+        console.log(`🔄 Player ${player.name} reconnected to room ${this.name}`);
+
+        return player;
+    }
+
+    // Check if a player can reconnect to this room
+    canReconnect(playerId) {
+        return this.disconnectedPlayers.has(playerId);
+    }
+
+    // Get count of active + disconnected players (for display purposes)
+    getTotalPlayerCount() {
+        return this.players.size + this.disconnectedPlayers.size;
+    }
+
     addSpectator(player) {
         player.isSpectator = true;
         player.roomId = this.id;
@@ -189,15 +257,34 @@ class GameRoom {
     }
 
     toJSON() {
+        // Include disconnected players in the player list with a flag
+        const allPlayers = Array.from(this.players.values()).map(p => p.toJSON());
+
+        // Add disconnected players with IsDisconnected flag
+        for (const [playerId, info] of this.disconnectedPlayers) {
+            allPlayers.push({
+                PlayerId: info.playerId,
+                DisplayName: info.name,
+                AvatarData: info.avatarData,
+                IsReady: info.isReady,
+                IsHost: info.isHost,
+                AssignedPosition: info.position,
+                IsMuted: false,
+                IsDisconnected: true,
+                DisconnectTime: info.disconnectTime
+            });
+        }
+
         return {
             RoomId: this.id,
             RoomName: this.name,
-            Players: Array.from(this.players.values()).map(p => p.toJSON()),
+            Players: allPlayers,
             MaxPlayers: this.maxPlayers,
             IsPrivate: false, // Always public
             GameInProgress: this.gameInProgress,
             CanStart: this.canStart(),
-            SpectatorCount: this.spectators.size
+            SpectatorCount: this.spectators.size,
+            DisconnectedCount: this.disconnectedPlayers.size
         };
     }
 
@@ -349,6 +436,10 @@ function handleMessage(ws, message) {
 
         case MessageType.StopSpectating:
             handleStopSpectating(ws, player);
+            break;
+
+        case MessageType.Reconnect:
+            handleReconnect(ws, player, Data);
             break;
 
         // Game actions - relay to room
@@ -655,14 +746,130 @@ function handleVoiceData(ws, player, data) {
     }, player.id);
 }
 
+function handleReconnect(ws, player, data) {
+    try {
+        const reconnectData = JSON.parse(data);
+        const oldPlayerId = reconnectData.PlayerId;
+        const roomId = reconnectData.RoomId;
+
+        console.log(`🔄 Reconnect attempt: ${oldPlayerId} to room ${roomId}`);
+
+        const room = rooms.get(roomId);
+        if (!room) {
+            sendError(ws, 'Room no longer exists');
+            return;
+        }
+
+        if (!room.canReconnect(oldPlayerId)) {
+            sendError(ws, 'Cannot reconnect - session expired or not found');
+            return;
+        }
+
+        // Reconnect the player
+        const reconnectedPlayer = room.reconnectPlayer(ws, oldPlayerId);
+        if (!reconnectedPlayer) {
+            sendError(ws, 'Reconnection failed');
+            return;
+        }
+
+        // Update our players map with the new ws -> player mapping
+        players.delete(ws);  // Remove the temporary player
+        players.set(ws, reconnectedPlayer);
+
+        console.log(`✅ ${reconnectedPlayer.name} successfully reconnected!`);
+
+        // Send success to the reconnected player
+        send(ws, {
+            Type: MessageType.ReconnectSuccess,
+            Data: JSON.stringify({
+                Room: room.toJSON(),
+                GameState: room.gameState
+            })
+        });
+
+        // Notify other players
+        room.broadcast({
+            Type: MessageType.PlayerReconnected,
+            Data: JSON.stringify(reconnectedPlayer.toJSON()),
+            SenderId: reconnectedPlayer.id
+        }, reconnectedPlayer.id);
+
+        // Send room update to all
+        room.broadcastToAll({
+            Type: MessageType.RoomUpdated,
+            Data: JSON.stringify(room.toJSON())
+        });
+
+    } catch (e) {
+        console.error('Error handling reconnect:', e);
+        sendError(ws, 'Reconnection failed');
+    }
+}
+
 function handleDisconnect(ws) {
     const player = players.get(ws);
     if (!player) return;
 
     console.log(`❌ Disconnected: ${player.name} (${player.id})`);
 
-    // Leave room if in one
+    // Check if player is in a room with a game in progress
     if (player.roomId) {
+        const room = rooms.get(player.roomId);
+
+        if (room && room.gameInProgress && !player.isSpectator) {
+            // Game in progress - mark as disconnected, allow reconnection
+            const disconnectInfo = room.markPlayerDisconnected(player.id);
+
+            if (disconnectInfo) {
+                // Notify other players that this player disconnected
+                room.broadcast({
+                    Type: MessageType.PlayerDisconnected,
+                    Data: JSON.stringify({
+                        PlayerId: player.id,
+                        Name: player.name,
+                        Position: disconnectInfo.position,
+                        ReconnectTimeout: RECONNECT_TIMEOUT
+                    })
+                });
+
+                // Send room update
+                room.broadcast({
+                    Type: MessageType.RoomUpdated,
+                    Data: JSON.stringify(room.toJSON())
+                });
+
+                // Set timeout to permanently remove if they don't reconnect
+                disconnectInfo.timeout = setTimeout(() => {
+                    if (room.disconnectedPlayers.has(player.id)) {
+                        console.log(`⏰ Reconnect timeout for ${player.name}, removing permanently`);
+                        room.disconnectedPlayers.delete(player.id);
+
+                        // Notify remaining players
+                        room.broadcast({
+                            Type: MessageType.PlayerLeft,
+                            Data: JSON.stringify({ PlayerId: player.id, Name: player.name, TimedOut: true })
+                        });
+
+                        room.broadcast({
+                            Type: MessageType.RoomUpdated,
+                            Data: JSON.stringify(room.toJSON())
+                        });
+
+                        // If no players left (all disconnected), end the game
+                        if (room.players.size === 0 && room.disconnectedPlayers.size === 0) {
+                            rooms.delete(room.id);
+                            console.log(`🗑️ Room deleted (all players left): ${room.name}`);
+                        }
+                    }
+                }, RECONNECT_TIMEOUT);
+
+                // Don't delete from players map immediately - they might reconnect
+                players.delete(ws);
+                return;
+            }
+        }
+
+        // No game in progress or is spectator - normal leave
         handleLeaveRoom(ws, player);
     }
 
