@@ -65,11 +65,10 @@ const MessageType = {
     RoundEnd: 'RoundEnd',
     GameOver: 'GameOver',
     GameState: 'GameState',
+    BotReplaced: 'BotReplaced',
 
-    // Voice
-    VoiceData: 'VoiceData',
-    MutePlayer: 'MutePlayer',
-    UnmutePlayer: 'UnmutePlayer',
+    // Social
+    EmojiReaction: 'EmojiReaction',
 
     // Spectator
     SpectateRoom: 'SpectateRoom',
@@ -130,6 +129,9 @@ class GameRoom {
         this.gameInProgress = false;
         this.gameState = null;
         this.createdAt = Date.now();
+        // Pass card buffering - hold cards until all players submit
+        this.pendingPassCards = new Map(); // position -> { Type, Data, SenderId }
+        this.botReplacedPositions = new Set(); // positions replaced by bots after disconnect timeout
     }
 
     addPlayer(player) {
@@ -225,7 +227,10 @@ class GameRoom {
 
     // Check if a player can reconnect to this room
     canReconnect(playerId) {
-        return this.disconnectedPlayers.has(playerId);
+        if (!this.disconnectedPlayers.has(playerId)) return false;
+        // Block reconnection if position was already replaced by bot
+        const info = this.disconnectedPlayers.get(playerId);
+        return !this.botReplacedPositions.has(info.position);
     }
 
     // Get count of active + disconnected players (for display purposes)
@@ -326,7 +331,7 @@ const wss = new WebSocket.Server({ server: httpServer });
 
 // Start HTTP server
 httpServer.listen(PORT, () => {
-    console.log(`🎴 Lekha Game Server starting on port ${PORT}...`);
+    console.log(`🎴 Lekha Game Server v2.1 (emoji+online count) starting on port ${PORT}...`);
     console.log(`✅ Server is running on port ${PORT}`);
     console.log(`🔗 HTTP: http://localhost:${PORT}/health`);
     console.log(`🔗 WebSocket: ws://localhost:${PORT}`);
@@ -341,11 +346,14 @@ wss.on('connection', (ws) => {
     const player = new Player(ws, playerId, 'Player');
     players.set(ws, player);
 
-    // Send connected message
+    // Send connected message with online player count
     send(ws, {
         Type: MessageType.Connected,
-        Data: JSON.stringify({ PlayerId: playerId })
+        Data: JSON.stringify({ PlayerId: playerId, OnlineCount: players.size })
     });
+
+    // Broadcast updated online count to all other connected players
+    broadcastOnlineCount();
 
     // Handle messages
     ws.on('message', (data) => {
@@ -462,14 +470,9 @@ function handleMessage(ws, message) {
             handleGameAction(ws, player, Type, Data);
             break;
 
-        // Voice data - relay to room
-        case MessageType.VoiceData:
-            handleVoiceData(ws, player, Data);
-            break;
-
-        case MessageType.MutePlayer:
-        case MessageType.UnmutePlayer:
-            // Just acknowledge, client handles local muting
+        // Emoji relay - broadcast to all other players in room
+        case MessageType.EmojiReaction:
+            handleEmojiReaction(ws, player, Data);
             break;
 
         default:
@@ -737,6 +740,12 @@ function handleSpectateRoom(ws, player, data) {
             Data: JSON.stringify(room.toJSON(true))
         });
 
+        // Send GameStarted so client transitions from lobby to game view
+        send(ws, {
+            Type: MessageType.GameStarted,
+            Data: JSON.stringify({ RoomId: room.id })
+        });
+
         if (room.gameState) {
             send(ws, {
                 Type: MessageType.GameState,
@@ -760,6 +769,34 @@ function handleStopSpectating(ws, player) {
     handleLeaveRoom(ws, player);
 }
 
+function handleEmojiReaction(ws, player, data) {
+    console.log(`😀 Emoji reaction from ${player.name} (${player.id}), roomId: ${player.roomId}, data: ${data}`);
+    if (!player.roomId) {
+        console.log(`😀 Emoji rejected: player has no roomId`);
+        return;
+    }
+    const room = rooms.get(player.roomId);
+    if (!room) {
+        console.log(`😀 Emoji rejected: room not found for ${player.roomId}`);
+        return;
+    }
+
+    // Relay emoji to all other players in the room
+    const message = JSON.stringify({
+        Type: MessageType.EmojiReaction,
+        Data: data
+    });
+
+    let sent = 0;
+    for (const [id, p] of room.players) {
+        if (id !== player.id && p.ws.readyState === 1) {
+            p.ws.send(message);
+            sent++;
+        }
+    }
+    console.log(`😀 Emoji relayed to ${sent}/${room.players.size - 1} other players in room`);
+}
+
 function handleGameAction(ws, player, type, data) {
     if (!player.roomId) return;
 
@@ -777,23 +814,43 @@ function handleGameAction(ws, player, type, data) {
         console.log(`🏁 Game over in room: ${room.name}`);
     }
 
+    // Special handling for PassCards - buffer until all 4 positions submit
+    if (type === MessageType.PassCards) {
+        // Key by FromPosition (not player.id) so host can submit for disconnected players
+        let fromPos = player.id; // fallback
+        try {
+            const parsed = JSON.parse(data);
+            if (parsed.FromPosition) fromPos = parsed.FromPosition;
+        } catch(e) { /* use fallback */ }
+
+        room.pendingPassCards.set(fromPos, {
+            Type: type,
+            Data: data,
+            SenderId: player.id
+        });
+
+        // Always need 4 pass submissions (active + disconnected + bot = 4 total)
+        const totalExpected = room.players.size + room.disconnectedPlayers.size + room.botReplacedPositions.size;
+        console.log(`📨 Pass cards buffered from ${fromPos} (${room.pendingPassCards.size}/${totalExpected})`);
+
+        if (room.pendingPassCards.size >= totalExpected) {
+            console.log(`✅ All ${totalExpected} positions passed - releasing cards`);
+            // Release all buffered pass cards to all players (no exclusion - clients filter by ToPosition)
+            for (const [key, msg] of room.pendingPassCards) {
+                room.broadcastToAll({
+                    Type: msg.Type,
+                    Data: msg.Data,
+                    SenderId: msg.SenderId
+                });
+            }
+            room.pendingPassCards.clear();
+        }
+        return; // Don't relay immediately
+    }
+
     // Relay to all players and spectators (except sender)
     room.broadcastToAll({
         Type: type,
-        Data: data,
-        SenderId: player.id
-    }, player.id);
-}
-
-function handleVoiceData(ws, player, data) {
-    if (!player.roomId) return;
-
-    const room = rooms.get(player.roomId);
-    if (!room) return;
-
-    // Relay voice data to all other players (not spectators for now)
-    room.broadcast({
-        Type: MessageType.VoiceData,
         Data: data,
         SenderId: player.id
     }, player.id);
@@ -891,16 +948,26 @@ function handleDisconnect(ws) {
                     Data: JSON.stringify(room.toJSON())
                 });
 
-                // Set timeout to permanently remove if they don't reconnect
+                // Set timeout to replace with bot if they don't reconnect
                 disconnectInfo.timeout = setTimeout(() => {
                     if (room.disconnectedPlayers.has(player.id)) {
-                        console.log(`⏰ Reconnect timeout for ${player.name}, removing permanently`);
+                        const dcInfo = room.disconnectedPlayers.get(player.id);
+                        console.log(`🤖 Reconnect timeout for ${player.name}, replacing with bot at ${dcInfo.position}`);
                         room.disconnectedPlayers.delete(player.id);
+                        room.botReplacedPositions.add(dcInfo.position);
 
-                        // Notify remaining players
+                        // If disconnected player was host, transfer host to next connected player
+                        if (dcInfo.isHost && room.players.size > 0) {
+                            const newHost = room.players.values().next().value;
+                            newHost.isHost = true;
+                            room.hostId = newHost.id;
+                            console.log(`👑 Host transferred to ${newHost.name}`);
+                        }
+
+                        // Notify remaining players that this position is now a bot
                         room.broadcast({
-                            Type: MessageType.PlayerLeft,
-                            Data: JSON.stringify({ PlayerId: player.id, Name: player.name, TimedOut: true })
+                            Type: MessageType.BotReplaced,
+                            Data: JSON.stringify({ PlayerId: player.id, Name: player.name, Position: dcInfo.position })
                         });
 
                         room.broadcast({
@@ -908,8 +975,8 @@ function handleDisconnect(ws) {
                             Data: JSON.stringify(room.toJSON())
                         });
 
-                        // If no players left (all disconnected), end the game
-                        if (room.players.size === 0 && room.disconnectedPlayers.size === 0) {
+                        // Only delete room if nobody is connected at all
+                        if (room.players.size === 0 && room.disconnectedPlayers.size === 0 && room.spectators.size === 0) {
                             rooms.delete(room.id);
                             console.log(`🗑️ Room deleted (all players left): ${room.name}`);
                         }
@@ -918,6 +985,7 @@ function handleDisconnect(ws) {
 
                 // Don't delete from players map immediately - they might reconnect
                 players.delete(ws);
+                broadcastOnlineCount();
                 return;
             }
         }
@@ -927,6 +995,24 @@ function handleDisconnect(ws) {
     }
 
     players.delete(ws);
+    broadcastOnlineCount();
+}
+
+function broadcastOnlineCount() {
+    const count = players.size;
+    console.log(`📊 Broadcasting online count: ${count} to ${players.size} players`);
+    const message = JSON.stringify({
+        Type: 'OnlineCount',
+        Data: JSON.stringify({ Count: count })
+    });
+    let sent = 0;
+    for (const [ws] of players) {
+        if (ws.readyState === 1) {
+            ws.send(message);
+            sent++;
+        }
+    }
+    console.log(`📊 Online count sent to ${sent}/${players.size} players`);
 }
 
 // Periodic cleanup of stale rooms
