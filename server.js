@@ -838,6 +838,12 @@ function handleGameAction(ws, player, type, data) {
         return;
     }
 
+    // Reject actions from disconnected players (except host submissions for bots)
+    if (!room.players.has(player.id) && player.id !== room.hostId) {
+        console.log(`⚠️ Ignoring ${type} from disconnected player ${player.name}`);
+        return;
+    }
+
     // Validate host-only messages
     const hostOnlyTypes = [MessageType.CardDealt, MessageType.TrickWon, MessageType.RoundEnd, MessageType.GameOver];
     if (hostOnlyTypes.includes(type) && player.id !== room.hostId) {
@@ -899,6 +905,12 @@ function handleGameAction(ws, player, type, data) {
                 console.log(`⚠️ PassCards from ${player.name}: position mismatch (player=${senderPosition}, from=${fromPos}), rejecting`);
                 return;
             }
+        }
+
+        // Dedup: reject if this position already submitted
+        if (room.pendingPassCards.has(fromPos)) {
+            console.log(`⚠️ Duplicate pass from ${fromPos}, ignoring`);
+            return;
         }
 
         room.pendingPassCards.set(fromPos, {
