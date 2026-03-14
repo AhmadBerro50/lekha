@@ -67,6 +67,10 @@ const MessageType = {
     GameState: 'GameState',
     BotReplaced: 'BotReplaced',
 
+    // Turn authority
+    TurnUpdate: 'TurnUpdate',
+    TurnTimeout: 'TurnTimeout',
+
     // Social
     EmojiReaction: 'EmojiReaction',
 
@@ -136,6 +140,57 @@ class GameRoom {
         this.pendingPassCards = new Map(); // position -> { Type, Data, SenderId }
         this.passCardTimeout = null; // Safety timeout for pass phase
         this.botReplacedPositions = new Set(); // positions replaced by bots after disconnect timeout
+        // Turn authority
+        this.currentTurn = null;      // Current position that should play (e.g., 'South')
+        this.trickCardCount = 0;       // Cards played in current trick (0-4)
+        this.turnTimeout = null;       // 30s timeout for current turn
+        this.turnOrder = ['South', 'East', 'North', 'West']; // Clockwise order
+    }
+
+    // Turn authority helpers
+    getNextPosition(position) {
+        const idx = this.turnOrder.indexOf(position);
+        if (idx === -1) return this.turnOrder[0];
+        return this.turnOrder[(idx + 1) % this.turnOrder.length];
+    }
+
+    advanceTurn() {
+        if (!this.currentTurn) return;
+        this.currentTurn = this.getNextPosition(this.currentTurn);
+        this.clearTurnTimeout();
+        this.startTurnTimeout();
+        // Broadcast TurnUpdate to all players and spectators
+        this.broadcastToAll({
+            Type: MessageType.TurnUpdate,
+            Data: JSON.stringify({ Position: this.currentTurn })
+        });
+    }
+
+    startTurnTimeout() {
+        this.clearTurnTimeout();
+        this.turnTimeout = setTimeout(() => {
+            if (this.currentTurn) {
+                console.log(`⏰ Turn timeout for ${this.currentTurn} in room ${this.name}`);
+                this.broadcastToAll({
+                    Type: MessageType.TurnTimeout,
+                    Data: JSON.stringify({ Position: this.currentTurn })
+                });
+                // Don't advance turn — let the client play a card which will advance it
+            }
+        }, 30000); // 30 seconds
+    }
+
+    clearTurnTimeout() {
+        if (this.turnTimeout) {
+            clearTimeout(this.turnTimeout);
+            this.turnTimeout = null;
+        }
+    }
+
+    resetTurnTracking() {
+        this.currentTurn = null;
+        this.trickCardCount = 0;
+        this.clearTurnTimeout();
     }
 
     addPlayer(player) {
@@ -736,6 +791,7 @@ function handleStartGame(ws, player) {
     }
 
     room.pendingPassCards.clear();
+    room.resetTurnTracking();
     room.gameInProgress = true;
     console.log(`🎮 Game started in room: ${room.name}`);
 
@@ -861,6 +917,7 @@ function handleGameAction(ws, player, type, data) {
         room.gameInProgress = false;
         room.pendingPassCards.clear();
         room.botReplacedPositions.clear();
+        room.resetTurnTracking();
         // Cancel any pending disconnect timers before clearing to avoid ghost timeouts
         for (const [, info] of room.disconnectedPlayers) {
             if (info.graceTimeout) clearTimeout(info.graceTimeout);
@@ -955,6 +1012,103 @@ function handleGameAction(ws, player, type, data) {
         return; // Don't relay immediately
     }
 
+    // === Turn authority: CardDealt ===
+    if (type === MessageType.CardDealt) {
+        try {
+            const cardDealtData = JSON.parse(data);
+            const startingPosition = cardDealtData.StartingPosition;
+            const validPositions = ['South', 'East', 'North', 'West'];
+            if (startingPosition && validPositions.includes(startingPosition)) {
+                room.currentTurn = startingPosition;
+                room.trickCardCount = 0;
+                room.clearTurnTimeout();
+                // Don't start turn timeout yet — pass phase happens first
+                // Turn timeout starts when first trick begins (after TrickWon or first CardPlayed)
+                console.log(`🎯 Turn authority: starting position set to ${startingPosition} in room ${room.name}`);
+            }
+        } catch (e) {
+            console.error('Error parsing CardDealt data for turn tracking:', e);
+        }
+    }
+
+    // === Turn authority: CardPlayed ===
+    if (type === MessageType.CardPlayed) {
+        try {
+            const cardPlayedData = JSON.parse(data);
+            const playedPosition = cardPlayedData.Position;
+            const validPositions = ['South', 'East', 'North', 'West'];
+
+            if (room.currentTurn && playedPosition && validPositions.includes(playedPosition)) {
+                // Validate it's the correct player's turn
+                if (playedPosition !== room.currentTurn) {
+                    // Allow host to play for the CURRENT turn position (bot replacement)
+                    if (player.id === room.hostId) {
+                        console.log(`🤖 Host playing for ${playedPosition} (current turn: ${room.currentTurn}) - allowed`);
+                        // Force the played position to match current turn for proper advancement
+                        // (host submits CardPlayed with the bot's position which should be currentTurn)
+                    } else {
+                        console.log(`⚠️ Turn violation: ${playedPosition} played but it's ${room.currentTurn}'s turn in room ${room.name} (sender: ${player.name})`);
+                        sendError(ws, `Not your turn. Current turn: ${room.currentTurn}`);
+                        return; // REJECT - don't relay
+                    }
+                }
+
+                room.trickCardCount++;
+                console.log(`🃏 Card played by ${playedPosition}, trick card count: ${room.trickCardCount}/4 in room ${room.name}`);
+
+                if (room.trickCardCount < 4) {
+                    // Advance to next player's turn
+                    room.currentTurn = room.getNextPosition(playedPosition);
+                    room.clearTurnTimeout();
+                    room.startTurnTimeout();
+                    // Broadcast TurnUpdate
+                    room.broadcastToAll({
+                        Type: MessageType.TurnUpdate,
+                        Data: JSON.stringify({ Position: room.currentTurn })
+                    });
+                } else {
+                    // Trick complete — wait for TrickWon from host
+                    room.clearTurnTimeout();
+                    room.currentTurn = null; // Temporarily null until TrickWon arrives
+                    console.log(`🃏 Trick complete (4 cards played), waiting for TrickWon in room ${room.name}`);
+                }
+            }
+        } catch (e) {
+            console.error('Error parsing CardPlayed data for turn tracking:', e);
+            // Don't block relay on parse error — fall through to relay
+        }
+    }
+
+    // === Turn authority: TrickWon ===
+    if (type === MessageType.TrickWon) {
+        try {
+            const trickWonData = JSON.parse(data);
+            const winnerPosition = trickWonData.WinnerPosition;
+            const validPositions = ['South', 'East', 'North', 'West'];
+
+            if (winnerPosition && validPositions.includes(winnerPosition)) {
+                room.currentTurn = winnerPosition;
+                room.trickCardCount = 0;
+                room.clearTurnTimeout();
+                room.startTurnTimeout();
+                console.log(`🏆 Trick won by ${winnerPosition}, they lead next in room ${room.name}`);
+                // Broadcast TurnUpdate
+                room.broadcastToAll({
+                    Type: MessageType.TurnUpdate,
+                    Data: JSON.stringify({ Position: room.currentTurn })
+                });
+            }
+        } catch (e) {
+            console.error('Error parsing TrickWon data for turn tracking:', e);
+        }
+    }
+
+    // === Turn authority: RoundEnd — reset turn tracking for next round ===
+    if (type === MessageType.RoundEnd) {
+        room.resetTurnTracking();
+        console.log(`🔄 Round ended, turn tracking reset in room ${room.name}`);
+    }
+
     // Relay to all players and spectators (except sender)
     room.broadcastToAll({
         Type: type,
@@ -1003,6 +1157,14 @@ function handleReconnect(ws, player, data) {
                 GameState: room.gameState
             })
         });
+
+        // Send current turn info to reconnecting player
+        if (room.currentTurn) {
+            send(ws, {
+                Type: MessageType.TurnUpdate,
+                Data: JSON.stringify({ Position: room.currentTurn })
+            });
+        }
 
         // Notify other players
         room.broadcast({
