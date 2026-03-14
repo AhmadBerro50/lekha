@@ -80,7 +80,10 @@ const MessageType = {
     StopSpectating: 'StopSpectating',
     SpectatorJoined: 'SpectatorJoined',
     SpectatorLeft: 'SpectatorLeft',
-    LiveGames: 'LiveGames'
+    LiveGames: 'LiveGames',
+
+    // Chat
+    ChatMessage: 'ChatMessage'
 };
 
 // Player positions
@@ -614,6 +617,11 @@ function handleMessage(ws, message) {
             handleEmojiReaction(ws, player, Data);
             break;
 
+        // Chat message relay - broadcast to all players in room
+        case MessageType.ChatMessage:
+            handleChatMessage(ws, player, Data);
+            break;
+
         default:
             console.log(`Unknown message type: ${Type}`);
     }
@@ -988,6 +996,31 @@ function handleEmojiReaction(ws, player, data) {
         }
     }
     console.log(`😀 Emoji relayed to ${sent}/${room.players.size - 1} other players in room`);
+}
+
+function handleChatMessage(ws, player, data) {
+    if (!player.roomId) return;
+    const room = rooms.get(player.roomId);
+    if (!room) return;
+
+    try {
+        const parsed = JSON.parse(data);
+        const message = {
+            PlayerId: player.id,
+            PlayerName: player.name,
+            Position: player.position,
+            Text: parsed.Text,
+            Timestamp: Date.now()
+        };
+
+        // Relay to ALL players and spectators (including sender for confirmation)
+        room.broadcastToAll({
+            Type: MessageType.ChatMessage,
+            Data: JSON.stringify(message)
+        });
+    } catch(e) {
+        console.error('Error handling chat message:', e);
+    }
 }
 
 function handleGameAction(ws, player, type, data) {
