@@ -114,8 +114,11 @@ class Player {
     }
 }
 
-// Reconnection timeout in milliseconds (60 seconds)
-const RECONNECT_TIMEOUT = 60 * 1000;
+// Reconnection timeout in milliseconds (3 minutes - allows for exponential backoff reconnection)
+const RECONNECT_TIMEOUT = 180 * 1000;
+
+// Grace period before broadcasting disconnect to other players (absorbs brief network blips)
+const DISCONNECT_GRACE_MS = 10 * 1000;
 
 class GameRoom {
     constructor(id, name, hostId) {
@@ -189,7 +192,8 @@ class GameRoom {
             isHost: player.isHost,
             isReady: player.isReady,
             disconnectTime: Date.now(),
-            timeout: null
+            timeout: null,
+            graceTimeout: null  // Short-grace timer before notifying other players
         };
 
         this.disconnectedPlayers.set(playerId, disconnectInfo);
@@ -205,7 +209,11 @@ class GameRoom {
         const disconnectInfo = this.disconnectedPlayers.get(playerId);
         if (!disconnectInfo) return null;
 
-        // Clear the timeout
+        // Clear both the grace timeout and the bot-replacement timeout
+        if (disconnectInfo.graceTimeout) {
+            clearTimeout(disconnectInfo.graceTimeout);
+            disconnectInfo.graceTimeout = null;
+        }
         if (disconnectInfo.timeout) {
             clearTimeout(disconnectInfo.timeout);
         }
@@ -410,6 +418,17 @@ function handleMessage(ws, message) {
                 player.name = profileData.DisplayName || 'Player';
                 player.avatarData = profileData.AvatarData;
                 console.log(`👤 Player registered: ${player.name} (${player.id})`);
+
+                // If player is already in a room, broadcast updated info to all players
+                if (player.roomId) {
+                    const room = rooms.get(player.roomId);
+                    if (room) {
+                        room.broadcast({
+                            Type: MessageType.RoomUpdated,
+                            Data: JSON.stringify(room.toJSON())
+                        });
+                    }
+                }
             } catch (e) {
                 console.error('Error parsing profile data:', e);
             }
@@ -554,6 +573,11 @@ function handleCreateRoom(ws, player, data) {
 
 function handleJoinRoom(ws, player, data) {
     try {
+        // If player is already in a room, leave it first
+        if (player.roomId) {
+            handleLeaveRoom(ws, player);
+        }
+
         const roomId = typeof data === 'string' ? data.replace(/"/g, '') : data;
         const room = rooms.get(roomId);
 
@@ -626,7 +650,11 @@ function handleLeaveRoom(ws, player) {
     }
 
     // Clean up empty rooms
-    if (room.players.size === 0 && room.spectators.size === 0) {
+    if (room.players.size === 0 && room.spectators.size === 0 && room.disconnectedPlayers.size === 0) {
+        // Clear any pending disconnect timeouts
+        for (const [, info] of room.disconnectedPlayers) {
+            if (info.timeout) clearTimeout(info.timeout);
+        }
         rooms.delete(room.id);
         console.log(`🗑️ Room deleted: ${room.name}`);
     }
@@ -652,6 +680,12 @@ function handleSelectPosition(ws, player, data) {
 
     const room = rooms.get(player.roomId);
     if (!room) return;
+
+    // Block position changes during game
+    if (room.gameInProgress) {
+        sendError(ws, 'Cannot change position during game');
+        return;
+    }
 
     // Parse the requested position (North, South, East, West)
     const requestedPosition = data;
@@ -707,6 +741,7 @@ function handleStartGame(ws, player) {
         return;
     }
 
+    room.pendingPassCards.clear();
     room.gameInProgress = true;
     console.log(`🎮 Game started in room: ${room.name}`);
 
@@ -803,25 +838,74 @@ function handleGameAction(ws, player, type, data) {
     const room = rooms.get(player.roomId);
     if (!room) return;
 
+    // Ignore game actions when no game is in progress (except GameState for spectators)
+    if (!room.gameInProgress && type !== MessageType.GameOver && type !== MessageType.GameState) {
+        console.log(`⚠️ Ignoring ${type} - no game in progress in room ${room.name}`);
+        return;
+    }
+
+    // Validate host-only messages
+    const hostOnlyTypes = [MessageType.CardDealt, MessageType.TrickWon, MessageType.RoundEnd, MessageType.GameOver];
+    if (hostOnlyTypes.includes(type) && player.id !== room.hostId) {
+        console.log(`⚠️ Rejecting ${type} from non-host ${player.name}`);
+        return;
+    }
+
     // Store game state if it's a state sync
     if (type === MessageType.GameState) {
         room.gameState = data;
     }
 
-    // Handle game over
+    // Handle game over - reset room for next game
     if (type === MessageType.GameOver) {
         room.gameInProgress = false;
-        console.log(`🏁 Game over in room: ${room.name}`);
+        room.pendingPassCards.clear();
+        room.botReplacedPositions.clear();
+        // Cancel any pending disconnect timers before clearing to avoid ghost timeouts
+        for (const [, info] of room.disconnectedPlayers) {
+            if (info.graceTimeout) clearTimeout(info.graceTimeout);
+            if (info.timeout) clearTimeout(info.timeout);
+        }
+        room.disconnectedPlayers.clear();
+        // Reset all player ready states so they must re-ready for next game
+        for (const p of room.players.values()) {
+            p.isReady = false;
+        }
+        console.log(`🏁 Game over in room: ${room.name} - ready states reset`);
+        // Broadcast updated room state so all clients see the lobby
+        room.broadcastToAll({
+            Type: MessageType.RoomUpdated,
+            Data: JSON.stringify(room.toJSON(true))
+        });
     }
 
     // Special handling for PassCards - buffer until all 4 positions submit
     if (type === MessageType.PassCards) {
         // Key by FromPosition (not player.id) so host can submit for disconnected players
-        let fromPos = player.id; // fallback
+        const validPositions = ['North', 'South', 'East', 'West'];
+        let fromPos = null;
         try {
             const parsed = JSON.parse(data);
-            if (parsed.FromPosition) fromPos = parsed.FromPosition;
-        } catch(e) { /* use fallback */ }
+            if (parsed.FromPosition && validPositions.includes(parsed.FromPosition)) {
+                fromPos = parsed.FromPosition;
+            }
+        } catch(e) { /* parse failed */ }
+
+        // Reject pass cards without a valid FromPosition
+        if (!fromPos) {
+            console.log(`⚠️ Rejecting PassCards from ${player.name} - missing or invalid FromPosition`);
+            return;
+        }
+
+        // Validate that the sender is submitting for their own position
+        const senderPosition = player.position;
+        if (senderPosition && fromPos && senderPosition !== fromPos) {
+            // Only allow if sender is host (host submits for bots)
+            if (player.id !== room.hostId) {
+                console.log(`⚠️ PassCards from ${player.name}: position mismatch (player=${senderPosition}, from=${fromPos}), rejecting`);
+                return;
+            }
+        }
 
         room.pendingPassCards.set(fromPos, {
             Type: type,
@@ -829,8 +913,8 @@ function handleGameAction(ws, player, type, data) {
             SenderId: player.id
         });
 
-        // Always need 4 pass submissions (active + disconnected + bot = 4 total)
-        const totalExpected = room.players.size + room.disconnectedPlayers.size + room.botReplacedPositions.size;
+        // Always need 4 pass submissions
+        const totalExpected = 4;
         console.log(`📨 Pass cards buffered from ${fromPos} (${room.pendingPassCards.size}/${totalExpected})`);
 
         if (room.pendingPassCards.size >= totalExpected) {
@@ -931,57 +1015,74 @@ function handleDisconnect(ws) {
             const disconnectInfo = room.markPlayerDisconnected(player.id);
 
             if (disconnectInfo) {
-                // Notify other players that this player disconnected
-                room.broadcast({
-                    Type: MessageType.PlayerDisconnected,
-                    Data: JSON.stringify({
-                        PlayerId: player.id,
-                        Name: player.name,
-                        Position: disconnectInfo.position,
-                        ReconnectTimeout: RECONNECT_TIMEOUT
-                    })
-                });
+                // Short grace period before notifying other players — absorbs brief network blips.
+                // If the player reconnects within DISCONNECT_GRACE_MS, no one ever sees a disconnect.
+                disconnectInfo.graceTimeout = setTimeout(() => {
+                    // Player hasn't come back — now tell everyone
+                    if (!room.disconnectedPlayers.has(player.id)) return; // Already reconnected
 
-                // Send room update
-                room.broadcast({
-                    Type: MessageType.RoomUpdated,
-                    Data: JSON.stringify(room.toJSON())
-                });
-
-                // Set timeout to replace with bot if they don't reconnect
-                disconnectInfo.timeout = setTimeout(() => {
-                    if (room.disconnectedPlayers.has(player.id)) {
-                        const dcInfo = room.disconnectedPlayers.get(player.id);
-                        console.log(`🤖 Reconnect timeout for ${player.name}, replacing with bot at ${dcInfo.position}`);
-                        room.disconnectedPlayers.delete(player.id);
-                        room.botReplacedPositions.add(dcInfo.position);
-
-                        // If disconnected player was host, transfer host to next connected player
-                        if (dcInfo.isHost && room.players.size > 0) {
-                            const newHost = room.players.values().next().value;
-                            newHost.isHost = true;
-                            room.hostId = newHost.id;
-                            console.log(`👑 Host transferred to ${newHost.name}`);
-                        }
-
-                        // Notify remaining players that this position is now a bot
-                        room.broadcast({
-                            Type: MessageType.BotReplaced,
-                            Data: JSON.stringify({ PlayerId: player.id, Name: player.name, Position: dcInfo.position })
-                        });
-
-                        room.broadcast({
-                            Type: MessageType.RoomUpdated,
-                            Data: JSON.stringify(room.toJSON())
-                        });
-
-                        // Only delete room if nobody is connected at all
-                        if (room.players.size === 0 && room.disconnectedPlayers.size === 0 && room.spectators.size === 0) {
-                            rooms.delete(room.id);
-                            console.log(`🗑️ Room deleted (all players left): ${room.name}`);
-                        }
+                    // Immediately transfer host role if the disconnected player was the host.
+                    // This lets the new host take over game logic within the grace period instead of
+                    // waiting the full RECONNECT_TIMEOUT (3 minutes).
+                    if (disconnectInfo.isHost && room.players.size > 0) {
+                        const newHost = room.players.values().next().value;
+                        newHost.isHost = true;
+                        room.hostId = newHost.id;
+                        disconnectInfo.isHost = false; // Prevent double-transfer in bot-replacement timeout
+                        console.log(`👑 Host transferred immediately to ${newHost.name} (disconnected host grace expired)`);
                     }
-                }, RECONNECT_TIMEOUT);
+
+                    console.log(`📢 Grace period expired for ${player.name}, notifying room`);
+
+                    room.broadcast({
+                        Type: MessageType.PlayerDisconnected,
+                        Data: JSON.stringify({
+                            PlayerId: player.id,
+                            Name: player.name,
+                            Position: disconnectInfo.position,
+                            ReconnectTimeout: RECONNECT_TIMEOUT
+                        })
+                    });
+
+                    room.broadcast({
+                        Type: MessageType.RoomUpdated,
+                        Data: JSON.stringify(room.toJSON())
+                    });
+
+                    // Start bot-replacement countdown from now
+                    disconnectInfo.timeout = setTimeout(() => {
+                        if (!rooms.has(room.id)) return; // Room was deleted
+                        if (room.disconnectedPlayers.has(player.id)) {
+                            const dcInfo = room.disconnectedPlayers.get(player.id);
+                            console.log(`🤖 Reconnect timeout for ${player.name}, replacing with bot at ${dcInfo.position}`);
+                            room.disconnectedPlayers.delete(player.id);
+                            room.botReplacedPositions.add(dcInfo.position);
+
+                            // If disconnected player was host, transfer host to next connected player
+                            if (dcInfo.isHost && room.players.size > 0) {
+                                const newHost = room.players.values().next().value;
+                                newHost.isHost = true;
+                                room.hostId = newHost.id;
+                                console.log(`👑 Host transferred to ${newHost.name}`);
+                            }
+
+                            room.broadcast({
+                                Type: MessageType.BotReplaced,
+                                Data: JSON.stringify({ PlayerId: player.id, Name: player.name, Position: dcInfo.position })
+                            });
+
+                            room.broadcast({
+                                Type: MessageType.RoomUpdated,
+                                Data: JSON.stringify(room.toJSON())
+                            });
+
+                            if (room.players.size === 0 && room.disconnectedPlayers.size === 0 && room.spectators.size === 0) {
+                                rooms.delete(room.id);
+                                console.log(`🗑️ Room deleted (all players left): ${room.name}`);
+                            }
+                        }
+                    }, RECONNECT_TIMEOUT);
+                }, DISCONNECT_GRACE_MS);
 
                 // Don't delete from players map immediately - they might reconnect
                 players.delete(ws);
@@ -1018,15 +1119,32 @@ function broadcastOnlineCount() {
 // Periodic cleanup of stale rooms
 setInterval(() => {
     const now = Date.now();
-    const staleTimeout = 30 * 60 * 1000; // 30 minutes
+    const staleTimeout = 10 * 60 * 1000; // 10 minutes for empty rooms
+    const abandonedTimeout = 5 * 60 * 1000; // 5 minutes for rooms with only disconnected players
 
     for (const [roomId, room] of rooms) {
-        if (room.players.size === 0 && (now - room.createdAt) > staleTimeout) {
-            rooms.delete(roomId);
-            console.log(`🧹 Cleaned up stale room: ${room.name}`);
+        const hasActivePlayers = room.players.size > 0;
+        const hasDisconnected = room.disconnectedPlayers.size > 0;
+        const age = now - room.createdAt;
+
+        // Clean up rooms with NO active players (only disconnected or empty)
+        if (!hasActivePlayers) {
+            const shouldDelete = (!hasDisconnected && age > staleTimeout) ||  // Empty for 10 min
+                                 (hasDisconnected && age > abandonedTimeout); // All disconnected for 5 min
+
+            if (shouldDelete) {
+                // Clear any pending timeouts
+                for (const [, info] of room.disconnectedPlayers) {
+                    if (info.timeout) clearTimeout(info.timeout);
+                    if (info.graceTimeout) clearTimeout(info.graceTimeout);
+                }
+                room.disconnectedPlayers.clear();
+                rooms.delete(roomId);
+                console.log(`🧹 Cleaned up stale room: ${room.name} (players: ${room.players.size}, disconnected: ${hasDisconnected ? 'yes' : 'no'}, age: ${Math.round(age/1000)}s)`);
+            }
         }
     }
-}, 60000); // Check every minute
+}, 30000); // Check every 30 seconds
 
 // Heartbeat to detect dead connections
 setInterval(() => {
