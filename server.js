@@ -52,6 +52,7 @@ const MessageType = {
     PlayerDisconnected: 'PlayerDisconnected',
     PlayerReconnected: 'PlayerReconnected',
     SelectPosition: 'SelectPosition',
+    DeselectPosition: 'DeselectPosition',
     PositionSelected: 'PositionSelected',
     SetReady: 'SetReady',
     StartGame: 'StartGame',
@@ -270,16 +271,8 @@ class GameRoom {
             return false;
         }
 
-        // Assign position
-        const positions = [PlayerPosition.South, PlayerPosition.West, PlayerPosition.North, PlayerPosition.East];
-        const takenPositions = Array.from(this.players.values()).map(p => p.position);
-        const availablePosition = positions.find(p => !takenPositions.includes(p));
-
-        if (!availablePosition) {
-            return false;
-        }
-
-        player.position = availablePosition;
+        // Player joins in the waiting area (no position assigned)
+        player.position = null;
         player.roomId = this.id;
         player.isHost = this.players.size === 0;
         this.players.set(player.id, player);
@@ -392,11 +385,16 @@ class GameRoom {
     }
 
     canStart() {
-        if (this.players.size !== 4) return false;
+        // Need exactly 4 players all with assigned positions and all ready
+        if (this.players.size < 4) return false;
+        let seatedCount = 0;
         for (const player of this.players.values()) {
-            if (!player.isReady) return false;
+            if (player.position !== null) {
+                seatedCount++;
+                if (!player.isReady) return false;
+            }
         }
-        return true;
+        return seatedCount === 4;
     }
 
     toJSON() {
@@ -588,6 +586,10 @@ function handleMessage(ws, message) {
 
         case MessageType.SelectPosition:
             handleSelectPosition(ws, player, Data);
+            break;
+
+        case MessageType.DeselectPosition:
+            handleDeselectPosition(ws, player, Data);
             break;
 
         case MessageType.StartGame:
@@ -817,20 +819,43 @@ function handleSelectPosition(ws, player, data) {
         return;
     }
 
-    // Check if position is already taken
+    // Check if position is already taken by another player
+    let occupyingPlayer = null;
     for (const p of room.players.values()) {
         if (p.position === requestedPosition && p.id !== player.id) {
-            sendError(ws, 'Position already taken');
-            return;
+            occupyingPlayer = p;
+            break;
         }
     }
 
-    // Assign the position
     const oldPosition = player.position;
-    player.position = requestedPosition;
-    console.log(`📍 ${player.name} selected position: ${requestedPosition}${oldPosition ? ' (was ' + oldPosition + ')' : ''}`);
 
-    // Notify all players in the room
+    if (occupyingPlayer) {
+        // Swap: occupying player gets requester's old position (or null if requester was in waiting)
+        const occupyingOldPosition = occupyingPlayer.position;
+        occupyingPlayer.position = oldPosition; // could be null (waiting area)
+        occupyingPlayer.isReady = false;
+        player.position = requestedPosition;
+        player.isReady = false;
+
+        console.log(`📍 ${player.name} swapped with ${occupyingPlayer.name}: ${player.name} → ${requestedPosition}, ${occupyingPlayer.name} → ${oldPosition || 'waiting'}`);
+
+        // Notify about the occupying player's position change
+        room.broadcast({
+            Type: MessageType.PositionSelected,
+            Data: JSON.stringify({
+                PlayerId: occupyingPlayer.id,
+                Position: occupyingPlayer.position,
+                OldPosition: occupyingOldPosition
+            })
+        });
+    } else {
+        // Position is free, just assign
+        player.position = requestedPosition;
+        console.log(`📍 ${player.name} selected position: ${requestedPosition}${oldPosition ? ' (was ' + oldPosition + ')' : ''}`);
+    }
+
+    // Notify all players about the requester's position change
     room.broadcast({
         Type: MessageType.PositionSelected,
         Data: JSON.stringify({
@@ -840,6 +865,27 @@ function handleSelectPosition(ws, player, data) {
         })
     });
 
+    room.broadcast({
+        Type: MessageType.RoomUpdated,
+        Data: JSON.stringify(room.toJSON(true))
+    });
+}
+
+function handleDeselectPosition(ws, player, data) {
+    if (!player.roomId) return;
+    const room = rooms.get(player.roomId);
+    if (!room || room.gameInProgress) return;
+
+    const oldPosition = player.position;
+    player.position = null;
+    player.isReady = false;
+
+    console.log(`📍 ${player.name} deselected position (was ${oldPosition || 'waiting'})`);
+
+    room.broadcast({
+        Type: MessageType.PositionSelected,
+        Data: JSON.stringify({ PlayerId: player.id, Position: null, OldPosition: oldPosition })
+    });
     room.broadcast({
         Type: MessageType.RoomUpdated,
         Data: JSON.stringify(room.toJSON(true))
