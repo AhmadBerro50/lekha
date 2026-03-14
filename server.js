@@ -501,20 +501,13 @@ function handleMessage(ws, message) {
 
 function sendRoomList(ws) {
     const availableRooms = [];
-    console.log(`📋 Checking ${rooms.size} total rooms for listing...`);
 
     for (const room of rooms.values()) {
-        const notInProgress = !room.gameInProgress;
-        const hasSpace = room.players.size < 4;
-
-        console.log(`  Room "${room.name}": notInProgress=${notInProgress}, hasSpace=${hasSpace} (${room.players.size}/4)`);
-
-        if (notInProgress && hasSpace) {
+        // Only list rooms that have at least 1 active player, aren't in-game, and have space
+        if (!room.gameInProgress && room.players.size > 0 && room.players.size < 4) {
             availableRooms.push(room.toJSON());
         }
     }
-
-    console.log(`📤 Sending ${availableRooms.length} rooms to client`);
 
     send(ws, {
         Type: MessageType.RoomList,
