@@ -144,6 +144,7 @@ class GameRoom {
         this.currentTurn = null;      // Current position that should play (e.g., 'South')
         this.trickCardCount = 0;       // Cards played in current trick (0-4)
         this.turnTimeout = null;       // 30s timeout for current turn
+        this.trickWonTimeout = null;   // 10s timeout waiting for TrickWon after 4 cards played
         this.turnOrder = ['South', 'East', 'North', 'West']; // Clockwise order
     }
 
@@ -175,7 +176,31 @@ class GameRoom {
                     Type: MessageType.TurnTimeout,
                     Data: JSON.stringify({ Position: this.currentTurn })
                 });
-                // Don't advance turn — let the client play a card which will advance it
+
+                // Check if the timed-out position has a connected player
+                let hasConnectedPlayer = false;
+                for (const p of this.players.values()) {
+                    if (p.position === this.currentTurn) {
+                        hasConnectedPlayer = true;
+                        break;
+                    }
+                }
+
+                if (!hasConnectedPlayer) {
+                    // No connected player at this position — auto-advance to prevent infinite timeout loop
+                    console.log(`⏰ No connected player at ${this.currentTurn}, auto-advancing turn in room ${this.name}`);
+                    this.trickCardCount++;
+                    if (this.trickCardCount < 4) {
+                        this.advanceTurn();
+                    } else {
+                        // Trick would be complete but no TrickWon will come — reset for safety
+                        this.clearTurnTimeout();
+                        this.currentTurn = null;
+                        console.log(`⏰ Trick auto-completed with disconnected player, waiting for TrickWon in room ${this.name}`);
+                        this.startTrickWonTimeout();
+                    }
+                }
+                // If player IS connected but laggy, don't advance — let the client play
             }
         }, 30000); // 30 seconds
     }
@@ -187,10 +212,57 @@ class GameRoom {
         }
     }
 
+    startTrickWonTimeout() {
+        this.clearTrickWonTimeout();
+        this.trickWonTimeout = setTimeout(() => {
+            if (this.currentTurn !== null) return; // TrickWon already arrived and set currentTurn
+
+            console.log(`⏰ TrickWon timeout in room ${this.name} — TrickWon never arrived after 10s`);
+
+            // Check if the host is still connected
+            let hostConnected = false;
+            for (const p of this.players.values()) {
+                if (p.id === this.hostId) {
+                    hostConnected = true;
+                    break;
+                }
+            }
+
+            if (hostConnected) {
+                // Host is connected but TrickWon was lost — ask them to resend
+                console.log(`⏰ Host is connected, requesting TrickWon resend in room ${this.name}`);
+                for (const p of this.players.values()) {
+                    if (p.id === this.hostId) {
+                        send(p.ws, {
+                            Type: MessageType.Error,
+                            Data: 'TrickWon timeout — please resend TrickWon'
+                        });
+                        break;
+                    }
+                }
+            } else {
+                // Host disconnected — broadcast TurnTimeout so clients can handle recovery
+                console.log(`⏰ Host disconnected, broadcasting TurnTimeout for trick recovery in room ${this.name}`);
+                this.broadcastToAll({
+                    Type: MessageType.TurnTimeout,
+                    Data: JSON.stringify({ Position: 'TrickWonMissing', Reason: 'HostDisconnected' })
+                });
+            }
+        }, 10000); // 10 seconds
+    }
+
+    clearTrickWonTimeout() {
+        if (this.trickWonTimeout) {
+            clearTimeout(this.trickWonTimeout);
+            this.trickWonTimeout = null;
+        }
+    }
+
     resetTurnTracking() {
         this.currentTurn = null;
         this.trickCardCount = 0;
         this.clearTurnTimeout();
+        this.clearTrickWonTimeout();
     }
 
     addPlayer(player) {
@@ -1070,6 +1142,7 @@ function handleGameAction(ws, player, type, data) {
                     // Trick complete — wait for TrickWon from host
                     room.clearTurnTimeout();
                     room.currentTurn = null; // Temporarily null until TrickWon arrives
+                    room.startTrickWonTimeout(); // 10s safety timeout in case TrickWon is lost
                     console.log(`🃏 Trick complete (4 cards played), waiting for TrickWon in room ${room.name}`);
                 }
             }
@@ -1090,6 +1163,7 @@ function handleGameAction(ws, player, type, data) {
                 room.currentTurn = winnerPosition;
                 room.trickCardCount = 0;
                 room.clearTurnTimeout();
+                room.clearTrickWonTimeout(); // TrickWon arrived, cancel safety timeout
                 room.startTurnTimeout();
                 console.log(`🏆 Trick won by ${winnerPosition}, they lead next in room ${room.name}`);
                 // Broadcast TurnUpdate
@@ -1268,6 +1342,12 @@ function handleDisconnect(ws) {
                         }
                     }, RECONNECT_TIMEOUT);
                 }, DISCONNECT_GRACE_MS);
+
+                // If all players have disconnected, clear turn tracking to prevent ghost timeouts
+                if (room.players.size === 0) {
+                    console.log(`⏰ All players disconnected from room ${room.name}, clearing turn tracking`);
+                    room.resetTurnTracking();
+                }
 
                 // Don't delete from players map immediately - they might reconnect
                 players.delete(ws);
