@@ -119,8 +119,8 @@ class Player {
     }
 }
 
-// Reconnection timeout in milliseconds (3 minutes - allows for exponential backoff reconnection)
-const RECONNECT_TIMEOUT = 180 * 1000;
+// Reconnection timeout in milliseconds (24 hours - effectively infinite, always wait for reconnect)
+const RECONNECT_TIMEOUT = 24 * 60 * 60 * 1000;
 
 // Grace period before broadcasting disconnect to other players (absorbs brief network blips)
 const DISCONNECT_GRACE_MS = 10 * 1000;
@@ -188,18 +188,10 @@ class GameRoom {
                 }
 
                 if (!hasConnectedPlayer) {
-                    // No connected player at this position — auto-advance to prevent infinite timeout loop
-                    console.log(`⏰ No connected player at ${this.currentTurn}, auto-advancing turn in room ${this.name}`);
-                    this.trickCardCount++;
-                    if (this.trickCardCount < 4) {
-                        this.advanceTurn();
-                    } else {
-                        // Trick would be complete but no TrickWon will come — reset for safety
-                        this.clearTurnTimeout();
-                        this.currentTurn = null;
-                        console.log(`⏰ Trick auto-completed with disconnected player, waiting for TrickWon in room ${this.name}`);
-                        this.startTrickWonTimeout();
-                    }
+                    // Disconnected player's turn — DON'T auto-advance.
+                    // Just keep re-broadcasting TurnTimeout every 30s so other players see the waiting message.
+                    console.log(`⏰ No connected player at ${this.currentTurn}, waiting for reconnect in room ${this.name}`);
+                    this.startTurnTimeout(); // Re-start the 30s timeout to keep broadcasting
                 }
                 // If player IS connected but laggy, don't advance — let the client play
             }
@@ -357,10 +349,8 @@ class GameRoom {
 
     // Check if a player can reconnect to this room
     canReconnect(playerId) {
-        if (!this.disconnectedPlayers.has(playerId)) return false;
-        // Block reconnection if position was already replaced by bot
-        const info = this.disconnectedPlayers.get(playerId);
-        return !this.botReplacedPositions.has(info.position);
+        // Always allow reconnection as long as the player is in disconnectedPlayers
+        return this.disconnectedPlayers.has(playerId);
     }
 
     // Get count of active + disconnected players (for display purposes)
@@ -1330,13 +1320,12 @@ function handleDisconnect(ws) {
                     if (!room.disconnectedPlayers.has(player.id)) return; // Already reconnected
 
                     // Immediately transfer host role if the disconnected player was the host.
-                    // This lets the new host take over game logic within the grace period instead of
-                    // waiting the full RECONNECT_TIMEOUT (3 minutes).
+                    // This lets the new host take over game logic within the grace period.
                     if (disconnectInfo.isHost && room.players.size > 0) {
                         const newHost = room.players.values().next().value;
                         newHost.isHost = true;
                         room.hostId = newHost.id;
-                        disconnectInfo.isHost = false; // Prevent double-transfer in bot-replacement timeout
+                        disconnectInfo.isHost = false; // Prevent double-transfer
                         console.log(`👑 Host transferred immediately to ${newHost.name} (disconnected host grace expired)`);
                     }
 
@@ -1357,39 +1346,9 @@ function handleDisconnect(ws) {
                         Data: JSON.stringify(room.toJSON())
                     });
 
-                    // Start bot-replacement countdown from now
-                    disconnectInfo.timeout = setTimeout(() => {
-                        if (!rooms.has(room.id)) return; // Room was deleted
-                        if (room.disconnectedPlayers.has(player.id)) {
-                            const dcInfo = room.disconnectedPlayers.get(player.id);
-                            console.log(`🤖 Reconnect timeout for ${player.name}, replacing with bot at ${dcInfo.position}`);
-                            room.disconnectedPlayers.delete(player.id);
-                            room.botReplacedPositions.add(dcInfo.position);
-
-                            // If disconnected player was host, transfer host to next connected player
-                            if (dcInfo.isHost && room.players.size > 0) {
-                                const newHost = room.players.values().next().value;
-                                newHost.isHost = true;
-                                room.hostId = newHost.id;
-                                console.log(`👑 Host transferred to ${newHost.name}`);
-                            }
-
-                            room.broadcast({
-                                Type: MessageType.BotReplaced,
-                                Data: JSON.stringify({ PlayerId: player.id, Name: player.name, Position: dcInfo.position })
-                            });
-
-                            room.broadcast({
-                                Type: MessageType.RoomUpdated,
-                                Data: JSON.stringify(room.toJSON())
-                            });
-
-                            if (room.players.size === 0 && room.disconnectedPlayers.size === 0 && room.spectators.size === 0) {
-                                rooms.delete(room.id);
-                                console.log(`🗑️ Room deleted (all players left): ${room.name}`);
-                            }
-                        }
-                    }, RECONNECT_TIMEOUT);
+                    // No bot replacement — keep player in disconnectedPlayers indefinitely
+                    // They can reconnect at any time until the room is cleaned up
+                    console.log(`⏳ ${player.name} will remain disconnected until they reconnect (no bot replacement)`);
                 }, DISCONNECT_GRACE_MS);
 
                 // If all players have disconnected, clear turn tracking to prevent ghost timeouts
