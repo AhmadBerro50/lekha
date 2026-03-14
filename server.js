@@ -342,7 +342,8 @@ class GameRoom {
         // Recreate the player with their original state
         const player = new Player(ws, playerId, disconnectInfo.name, disconnectInfo.avatarData);
         player.position = disconnectInfo.position;
-        player.isHost = disconnectInfo.isHost;
+        // Use actual room hostId — host may have been transferred during disconnect
+        player.isHost = (playerId === this.hostId);
         player.isReady = disconnectInfo.isReady;
         player.roomId = this.id;
 
@@ -385,16 +386,15 @@ class GameRoom {
     }
 
     canStart() {
-        // Need exactly 4 players all with assigned positions and all ready
+        // Need exactly 4 players with 4 DISTINCT positions, all ready
         if (this.players.size < 4) return false;
-        let seatedCount = 0;
+        const positions = new Set();
         for (const player of this.players.values()) {
-            if (player.position !== null) {
-                seatedCount++;
-                if (!player.isReady) return false;
-            }
+            if (player.position === null) continue;
+            if (!player.isReady) return false;
+            positions.add(player.position);
         }
-        return seatedCount === 4;
+        return positions.size === 4;
     }
 
     toJSON() {
@@ -1012,8 +1012,8 @@ function handleGameAction(ws, player, type, data) {
         return;
     }
 
-    // Reject actions from disconnected players (except host submissions for bots)
-    if (!room.players.has(player.id) && player.id !== room.hostId) {
+    // Reject actions from disconnected players — only connected players can submit
+    if (!room.players.has(player.id)) {
         console.log(`⚠️ Ignoring ${type} from disconnected player ${player.name}`);
         return;
     }
@@ -1034,6 +1034,7 @@ function handleGameAction(ws, player, type, data) {
     if (type === MessageType.GameOver) {
         room.gameInProgress = false;
         room.pendingPassCards.clear();
+        if (room.passCardTimeout) { clearTimeout(room.passCardTimeout); room.passCardTimeout = null; }
         room.botReplacedPositions.clear();
         room.resetTurnTracking();
         // Cancel any pending disconnect timers before clearing to avoid ghost timeouts
@@ -1102,11 +1103,9 @@ function handleGameAction(ws, player, type, data) {
         if (room.pendingPassCards.size === 1 && !room.passCardTimeout) {
             room.passCardTimeout = setTimeout(() => {
                 if (room.pendingPassCards.size > 0 && room.pendingPassCards.size < totalExpected) {
-                    console.log(`⚠️ Pass card timeout in room ${room.name} — releasing ${room.pendingPassCards.size}/${totalExpected} received cards`);
-                    // Release whatever we have
-                    for (const [key, msg] of room.pendingPassCards) {
-                        room.broadcastToAll({ Type: msg.Type, Data: msg.Data, SenderId: msg.SenderId });
-                    }
+                    console.log(`⚠️ Pass card timeout in room ${room.name} — discarding ${room.pendingPassCards.size}/${totalExpected} partial passes`);
+                    // Don't broadcast partial passes — they'll break game state
+                    // Just clear them and let the client-side timeout handle recovery
                     room.pendingPassCards.clear();
                 }
                 room.passCardTimeout = null;
