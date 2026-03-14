@@ -134,6 +134,7 @@ class GameRoom {
         this.createdAt = Date.now();
         // Pass card buffering - hold cards until all players submit
         this.pendingPassCards = new Map(); // position -> { Type, Data, SenderId }
+        this.passCardTimeout = null; // Safety timeout for pass phase
         this.botReplacedPositions = new Set(); // positions replaced by bots after disconnect timeout
     }
 
@@ -910,9 +911,26 @@ function handleGameAction(ws, player, type, data) {
         const totalExpected = 4;
         console.log(`📨 Pass cards buffered from ${fromPos} (${room.pendingPassCards.size}/${totalExpected})`);
 
+        // Start a safety timeout on first pass submission
+        if (room.pendingPassCards.size === 1 && !room.passCardTimeout) {
+            room.passCardTimeout = setTimeout(() => {
+                if (room.pendingPassCards.size > 0 && room.pendingPassCards.size < totalExpected) {
+                    console.log(`⚠️ Pass card timeout in room ${room.name} — releasing ${room.pendingPassCards.size}/${totalExpected} received cards`);
+                    // Release whatever we have
+                    for (const [key, msg] of room.pendingPassCards) {
+                        room.broadcastToAll({ Type: msg.Type, Data: msg.Data, SenderId: msg.SenderId });
+                    }
+                    room.pendingPassCards.clear();
+                }
+                room.passCardTimeout = null;
+            }, 25000); // 25 second timeout
+        }
+
         if (room.pendingPassCards.size >= totalExpected) {
+            // Clear timeout
+            if (room.passCardTimeout) { clearTimeout(room.passCardTimeout); room.passCardTimeout = null; }
+
             console.log(`✅ All ${totalExpected} positions passed - releasing cards`);
-            // Release all buffered pass cards to all players (no exclusion - clients filter by ToPosition)
             for (const [key, msg] of room.pendingPassCards) {
                 room.broadcastToAll({
                     Type: msg.Type,
