@@ -1075,12 +1075,14 @@ function handleGameAction(ws, player, type, data) {
 
         // Validate that the sender is submitting for their own position
         const senderPosition = player.position;
+        console.log(`📨 PassCards validation: sender=${player.name}, senderPos=${senderPosition}, fromPos=${fromPos}, isHost=${player.id === room.hostId}`);
         if (senderPosition && fromPos && senderPosition !== fromPos) {
             // Only allow if sender is host (host submits for bots)
             if (player.id !== room.hostId) {
                 console.log(`⚠️ PassCards from ${player.name}: position mismatch (player=${senderPosition}, from=${fromPos}), rejecting`);
                 return;
             }
+            console.log(`✅ Host submitting pass for position ${fromPos} (host is at ${senderPosition})`);
         }
 
         // Dedup: reject if this position already submitted
@@ -1103,9 +1105,11 @@ function handleGameAction(ws, player, type, data) {
         if (room.pendingPassCards.size === 1 && !room.passCardTimeout) {
             room.passCardTimeout = setTimeout(() => {
                 if (room.pendingPassCards.size > 0 && room.pendingPassCards.size < totalExpected) {
-                    console.log(`⚠️ Pass card timeout in room ${room.name} — discarding ${room.pendingPassCards.size}/${totalExpected} partial passes`);
-                    // Don't broadcast partial passes — they'll break game state
-                    // Just clear them and let the client-side timeout handle recovery
+                    console.log(`⚠️ Pass card timeout in room ${room.name} — releasing ${room.pendingPassCards.size}/${totalExpected} partial passes`);
+                    // Release whatever we have so clients can proceed
+                    for (const [key, msg] of room.pendingPassCards) {
+                        room.broadcastToAll({ Type: msg.Type, Data: msg.Data, SenderId: msg.SenderId });
+                    }
                     room.pendingPassCards.clear();
                 }
                 room.passCardTimeout = null;
