@@ -1103,7 +1103,7 @@ function handleGameAction(ws, player, type, data) {
                     room.pendingPassCards.clear();
                 }
                 room.passCardTimeout = null;
-            }, 25000); // 25 second timeout
+            }, 50000); // 50 second timeout
         }
 
         if (room.pendingPassCards.size >= totalExpected) {
